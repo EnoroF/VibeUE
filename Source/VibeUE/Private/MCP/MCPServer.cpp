@@ -854,6 +854,7 @@ FString FMCPServer::HandleToolsList(TSharedPtr<FJsonObject> Params, const FStrin
 
 FString FMCPServer::HandleToolsCall(TSharedPtr<FJsonObject> Params, const FString& RequestId)
 {
+    /*
     // Check VibeUE API key validity before executing any tool
     if (!bIsVibeUEApiKeyValid)
     {
@@ -867,6 +868,7 @@ FString FMCPServer::HandleToolsCall(TSharedPtr<FJsonObject> Params, const FStrin
         Result->SetBoolField(TEXT("isError"), true);
         return BuildJsonRpcResponse(RequestId, Result);
     }
+    */
 
     if (!Params.IsValid())
     {

@@ -63,7 +63,8 @@ void FAIChatCommands::Initialize()
     
     // Register menus via startup callback to ensure UToolMenus is fully initialized
     UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateStatic(&FAIChatCommands::RegisterMenus));
-    
+   
+    /*
     // Register status bar panel drawer (after editor is ready)
     if (GEditor)
     {
@@ -73,6 +74,7 @@ void FAIChatCommands::Initialize()
     {
         FCoreDelegates::OnPostEngineInit.AddStatic(&FAIChatCommands::RegisterStatusBarPanelDrawer);
     }
+    */
     
     UE_LOG(LogTemp, Log, TEXT("AI Chat commands initialized with panel drawer support"));
 }
