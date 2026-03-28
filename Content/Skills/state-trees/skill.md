@@ -106,6 +106,74 @@ For `STT_*` graph edits, do not report success until the output explicitly shows
 If compile succeeds but any of the checks above fail, the graph is still wrong.
 If compile succeeds but some required node IDs were empty during creation, the graph is still wrong.
 
+## Sending a StateTree Event with a Struct Payload from Blueprint
+
+When an actor Blueprint needs to send a StateTree event that carries data (e.g. a target pawn,
+position, or any custom struct), use this three-node chain:
+
+```
+Make <FMyStruct>  →  Make Instanced Struct  →  Make State Tree Event  →  Send State Tree Event
+```
+
+**Always load `blueprint-graphs`** before writing this code — the node types (`make_struct`,
+`instanced_struct`) are documented there.
+
+### Why Instanced Struct?
+
+`Make State Tree Event.Payload` expects `FInstancedStruct`, not a raw struct. `Make Instanced Struct`
+wraps any struct into `FInstancedStruct`. The struct type must be set at node creation time so the
+`Value` wildcard pin resolves correctly — **do not try to connect `Value` before the struct type
+is configured**.
+
+### Pattern (using `build_graph`)
+
+```python
+import unreal
+
+bp_path = "/Game/StateTree/BP_Cube.BP_Cube"
+graph = "EventGraph"
+
+# Read existing node IDs first (Set TargetPawn, Get StateTree, Make State Tree Event, etc.)
+nodes = unreal.BlueprintService.get_nodes_in_graph(bp_path, graph)
+set_pawn_id    = next(n.node_id for n in nodes if n.node_title == "Set TargetPawn" and ...)
+make_event_id  = next(n.node_id for n in nodes if n.node_title == "Make State Tree Event")
+send_event_id  = next(n.node_id for n in nodes if "Send State Tree Event" in n.node_title)
+
+result = unreal.BlueprintService.build_graph(
+    bp_path, graph,
+    [
+        {"ref": "MkPayload", "type": "make_struct",     "params": {"struct": "FMyPayload"}},
+        {"ref": "MkInst",    "type": "instanced_struct","params": {"struct": "FMyPayload"}},
+    ],
+    [
+        # Rewire execution: SetPawn.then → MkPayload → MkInst → SendEvent
+        # (disconnect old SetPawn.then → SendEvent first if needed)
+        {"from_": "MkPayload.MyPayload",  "to": "MkInst.Value"},
+        {"from_": "MkInst.ReturnValue",   "to": f"{make_event_id}.Payload"},
+    ],
+    [],
+    True, True
+)
+```
+
+### Pin names to verify
+
+| Node | Key pins |
+|------|----------|
+| `Make <FMyPayload>` (`make_struct`) | Output: struct type name (check with `get_node_pins()`) |
+| `Make Instanced Struct` (`instanced_struct`) | Input: `Value`; Output: `ReturnValue` |
+| `Make State Tree Event` | Inputs: `Tag` (FGameplayTag), `Payload` (FInstancedStruct), `Origin` (FName) |
+| `Send State Tree Event` | Inputs: `execute`, `self` (StateTreeComponent), `Event` (FStateTreeEvent) |
+
+### ⚠️ Common Mistakes
+
+- Connecting `Cast.AsPawn → MakeInst.Value.TargetPawn` directly — **fails**. You must go through
+  `Make <FMyPayload>` first to populate the struct fields, then feed the struct into `MakeInst.Value`.
+- Forgetting to disconnect the old `SetPawn.then → SendEvent.execute` wire before inserting the
+  new nodes in between.
+- Not passing the `struct` param to `instanced_struct` — the `Value` pin stays a wildcard and
+  connections will fail at compile time.
+
 ## Key Concepts
 
 | Concept | Description |
@@ -163,6 +231,11 @@ if not result.success:
 
 # 6. Save
 unreal.StateTreeService.save_state_tree("/Game/AI/MyBehavior")
+
+# 7. Select the last state you modified so the user can see it
+unreal.VibeUEService.manage_asset(action="open", asset_path="/Game/AI/MyBehavior")
+unreal.StateTreeService.set_state_expanded("/Game/AI/MyBehavior", "Root", True)
+unreal.StateTreeService.select_state("/Game/AI/MyBehavior", "Root/Walking")  # select whichever state you just edited
 ```
 
 ## API Reference
@@ -185,8 +258,9 @@ info = unreal.StateTreeService.get_state_tree_info("/Game/AI/MyBehavior")
 # Each FStateTreeStateInfo has:
 #   .name, .path, .state_type, .selection_behavior, .enabled
 #   .theme_color (display name of assigned color, empty if none)
-#   .b_expanded (whether state is expanded in editor tree view)
 #   .tasks, .enter_conditions, .transitions, .child_paths
+# NOTE: Do NOT access .expanded — it may not be exposed depending on the
+#       compiled plugin version. Use set_state_expanded() directly instead.
 ```
 
 ### Asset Creation
@@ -224,6 +298,29 @@ unreal.StateTreeService.rename_theme_color("/Game/AI/MyBehavior", "Default Color
 unreal.StateTreeService.set_state_expanded("/Game/AI/MyBehavior", "Root/Walking", False)  # collapse
 unreal.StateTreeService.set_state_expanded("/Game/AI/MyBehavior", "Root/Walking", True)   # expand
 ```
+
+#### Editor State Selection
+
+Use `select_state` to highlight a state in the StateTree editor panel (equivalent to clicking it).
+
+**Trigger:** If the user asks to "focus", "view", "open", or "select" a state — they all mean the same thing. Use this workflow for all of them.
+
+**Also:** After ANY modification to a state (add task, add transition, set property, etc.), always call `select_state` on the state you just changed so the user can see the result in the editor.
+
+```python
+import unreal
+
+# Open the asset first (if not already open)
+unreal.VibeUEService.manage_asset(action="open", asset_path="/Game/AI/ST_Cube")
+
+# Expand parents so the state is visible
+unreal.StateTreeService.set_state_expanded("/Game/AI/ST_Cube", "Root", True)
+
+# Select the state — highlights it in the editor panel
+unreal.StateTreeService.select_state("/Game/AI/ST_Cube", "Root/Idle")
+```
+
+`select_state` calls `FStateTreeViewModel::SetSelection` via `UStateTreeEditingSubsystem`, which is exactly what the editor does when the user clicks a state node. The asset must already be open in an editor tab.
 
 ### Tasks
 
@@ -377,6 +474,8 @@ unreal.StateTreeService.add_global_task("/Game/AI/MyBehavior", "FStateTreeDelayT
 #   OnStateFailed      — only on task failure
 #   OnTick             — every tick (use with conditions)
 #   OnEvent            — on gameplay event
+#   OnDelegate         — when a task's FStateTreeDelegateDispatcher fires
+#                        (requires bind_transition_to_delegate after setting trigger)
 
 # Transition types:
 #   GotoState          — go to a specific state (requires target_path)
@@ -402,6 +501,72 @@ unreal.StateTreeService.add_transition(
     "/Game/AI/MyBehavior", "Root/Attacking",
     "OnStateSucceeded", "GotoState", "Root/Attacking")
 ```
+
+### OnDelegate Transitions — Full Workflow
+
+`OnDelegate` transitions fire when a task's `FStateTreeDelegateDispatcher` property broadcasts.
+This requires **three steps**: add the dispatcher variable, set the trigger, bind the transition.
+
+#### ⚠️ Expected Compile Error — Do NOT Revert
+
+After calling `update_transition(trigger="OnDelegate")`, compiling will produce:
+
+```
+"<StateName> On Delegate Transition to '<TargetState>' requires to be bound to some delegate dispatcher."
+```
+
+**This is expected.** The binding step (`bind_transition_to_delegate`) hasn't been done yet.
+Do NOT revert the trigger back to `OnStateCompleted` — continue with the workflow below.
+
+#### Step-by-Step
+
+```python
+import unreal
+
+bp_path = "/Game/StateTree/Tasks/STT_Rotate"
+st_path = "/Game/StateTree/ST_Cube"
+state_path = "Root/Rotating"
+transition_index = 0  # from get_state_tree_info
+
+# Step 1: Add a FStateTreeDelegateDispatcher variable to the Blueprint task
+if not unreal.BlueprintService.variable_exists(bp_path, "FinishRotatingDispatcher"):
+    result = unreal.BlueprintService.add_variable(bp_path, "FinishRotatingDispatcher", "FStateTreeDelegateDispatcher")
+    assert result, "Failed to add FinishRotatingDispatcher variable"
+    unreal.BlueprintService.compile_blueprint(bp_path)
+    unreal.EditorAssetLibrary.save_asset(bp_path)
+
+# Step 2: Set the transition trigger to OnDelegate
+result = unreal.StateTreeService.update_transition(st_path, state_path, transition_index, trigger="OnDelegate")
+assert result, "update_transition failed"
+
+# Step 3: Bind the transition to the dispatcher property
+result = unreal.StateTreeService.bind_transition_to_delegate(
+    st_path, state_path, transition_index,
+    "STT_Rotate",                  # task name (display name, Blueprint name, or struct type)
+    "FinishRotatingDispatcher"     # the FStateTreeDelegateDispatcher variable name
+)
+assert result, "bind_transition_to_delegate failed"
+
+# Step 4: Compile — should now succeed with no delegate errors
+compile_result = unreal.StateTreeService.compile_state_tree(st_path)
+assert compile_result.success, compile_result.errors
+unreal.StateTreeService.save_state_tree(st_path)
+```
+
+#### Firing the Dispatcher from the Blueprint Task
+
+In `STT_Rotate`'s Blueprint graph, call the dispatcher to trigger the transition:
+
+```python
+# The dispatcher is called like a function in Blueprint — add a "Call FinishRotatingDispatcher" node
+# connected to whatever execution flow should end the state (e.g. after a timer, animation, etc.)
+```
+
+#### Notes
+
+- `FStateTreeDelegateDispatcher` is a USTRUCT — use type string `"FStateTreeDelegateDispatcher"` with `add_variable`.
+- The dispatcher variable must be on the task that is **in the same state** as the `OnDelegate` transition.
+- After `bind_transition_to_delegate`, the compile error about the missing binding will resolve.
 
 ### Compile & Save
 
@@ -773,8 +938,8 @@ assert result.success, result.error_message
 ### ⚠️ Condition Properties That Require Bindings (e.g. "Object")
 
 Conditions like `StateTreeObjectIsValidCondition` have properties that **must be bound**
-to context data — setting a string value won't work. Use `bind_transition_condition_property_to_context`
-or `bind_enter_condition_property_to_context` instead of `set_*_condition_property_value`.
+to context data or event payload — setting a string value won't work. Use `bind_transition_condition_property_to_context`,
+`bind_enter_condition_property_to_context`, or `bind_transition_condition_property_to_event_payload` instead of `set_*_condition_property_value`.
 
 ```python
 # WRONG — trying to set "Object" as a string value (will fail or compile error)
@@ -784,6 +949,17 @@ unreal.StateTreeService.set_transition_condition_property_value(
 # CORRECT — bind it to the context actor's property
 unreal.StateTreeService.bind_transition_condition_property_to_context(
     path, "Root", 0, "StateTreeObjectIsValidCondition", "Object", "Actor", "TargetPawn")
+
+# CORRECT — bind it to the transition's event payload property
+# (when the transition has a RequiredEvent with a PayloadStruct like FStartChasingPayload)
+# First inspect the payload fields instead of guessing the path.
+payload_props = unreal.StateTreeService.get_transition_event_payload_property_names(path, "Root", 0)
+for p in payload_props:
+    print(f"{p.name}: {p.type} = {p.current_value!r}")
+
+# The bind helper accepts friendly field names and resolves them to the reflected path.
+unreal.StateTreeService.bind_transition_condition_property_to_event_payload(
+    path, "Root", 0, "StateTreeObjectIsValidCondition", "Object", "TargetPawn")
 ```
 
 ### ⚠️ Bool Properties Drop the `b` Prefix in Python
@@ -946,6 +1122,8 @@ unreal.StateTreeService.update_transition(
     transition_type="GotoState",
     target_path="Root/Walking",
     priority="Normal",
+    event_tag="",                     # gameplay tag for OnEvent trigger
+    event_payload_struct="",          # e.g. "FStartChasingPayload", "None" to clear
     b_set_enabled=True, b_enabled=True,
     b_set_delay=True, b_delay_transition=True, delay_duration=1.5, delay_random_variance=0.5
 )
@@ -1024,6 +1202,15 @@ unreal.StateTreeService.bind_transition_condition_property_to_context(
 # Leave ContextPropertyPath empty to bind the whole context object
 unreal.StateTreeService.bind_transition_condition_property_to_context(
     path, "Root", 0, "StateTreeObjectIsValidCondition", "Object", "Actor")
+
+# Bind a transition condition property to the transition's event payload
+# (transition must have RequiredEvent.PayloadStruct set)
+payload_props = unreal.StateTreeService.get_transition_event_payload_property_names(path, "Root/Chasing", 0)
+for p in payload_props:
+    print(f"{p.name}: {p.type} = {p.current_value!r}")
+
+unreal.StateTreeService.bind_transition_condition_property_to_event_payload(
+    path, "Root/Chasing", 0, "StateTreeObjectIsValidCondition", "Object", "TargetPawn")
 ```
 
 ### Evaluator & Global Task Management (Extended)
@@ -1179,5 +1366,6 @@ for t in types:
 - `delay_duration` (float)
 - `delay_random_variance` (float)
 - `required_event_tag` (str)
+- `event_payload_struct` (str) — payload struct type name (e.g. "FStartChasingPayload"), empty if none
 - `conditions` (list of `FStateTreeNodeInfo`)
 - `condition_operands` (list of str)

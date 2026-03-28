@@ -9,6 +9,7 @@
 #include "GameFramework/Actor.h"
 #include "UObject/SavePackage.h"
 #include "UObject/Package.h"
+#include "UObject/StructOnScope.h"
 #include "UObject/UnrealType.h"
 #include "Misc/PackageName.h"
 #include "StructUtils/PropertyBag.h"
@@ -28,6 +29,9 @@
 #include "StateTreeCompiler.h"
 #include "StateTreeCompilerLog.h"
 #include "Blueprint/StateTreeTaskBlueprintBase.h"
+#include "StateTreeEditingSubsystem.h"
+#include "StateTreeViewModel.h"
+#include "Editor.h"
 
 // For class discovery
 #include "UObject/UObjectIterator.h"
@@ -406,6 +410,196 @@ static void AppendEditableProperties(const UStruct* RootStruct, void* RootValue,
 		}
 
 		AppendPropertyInfo(Property, RootValue, TEXT(""), OutProperties, SeenPropertyPaths);
+	}
+}
+
+static FString GetBindablePropertySegmentName(const FProperty* Property)
+{
+	if (!Property)
+	{
+		return TEXT("");
+	}
+
+	const FString AuthoredName = Property->GetAuthoredName();
+	return AuthoredName.IsEmpty() ? Property->GetName() : AuthoredName;
+}
+
+static bool FindBindablePropertyBySegment(const UStruct* OwnerStruct, const FString& RequestedSegment, FProperty*& OutProperty)
+{
+	OutProperty = nullptr;
+	if (!OwnerStruct || RequestedSegment.IsEmpty())
+	{
+		return false;
+	}
+
+	for (TFieldIterator<FProperty> It(OwnerStruct, EFieldIterationFlags::IncludeSuper); It; ++It)
+	{
+		FProperty* Property = *It;
+		if (!Property || Property->GetOwnerStruct() != OwnerStruct)
+		{
+			continue;
+		}
+
+		const FString RawName = Property->GetName();
+		const FString AuthoredName = GetBindablePropertySegmentName(Property);
+		if (RawName.Equals(RequestedSegment, ESearchCase::IgnoreCase)
+			|| AuthoredName.Equals(RequestedSegment, ESearchCase::IgnoreCase))
+		{
+			OutProperty = Property;
+			return true;
+		}
+
+		int32 UnderscoreIndex = INDEX_NONE;
+		if (RawName.FindChar(TEXT('_'), UnderscoreIndex))
+		{
+			const FString BaseName = RawName.Left(UnderscoreIndex);
+			if (!BaseName.IsEmpty() && BaseName.Equals(RequestedSegment, ESearchCase::IgnoreCase))
+			{
+				OutProperty = Property;
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static bool ResolveBindablePropertyPathAgainstStruct(const UStruct* RootStruct, const FString& RequestedPath, FString& OutResolvedPath)
+{
+	OutResolvedPath = RequestedPath;
+	if (!RootStruct)
+	{
+		return false;
+	}
+
+	if (RequestedPath.IsEmpty())
+	{
+		OutResolvedPath = TEXT("");
+		return true;
+	}
+
+	TArray<FString> RequestedSegments;
+	RequestedPath.ParseIntoArray(RequestedSegments, TEXT("."), true);
+	if (RequestedSegments.IsEmpty())
+	{
+		return false;
+	}
+
+	const UStruct* CurrentStruct = RootStruct;
+	TArray<FString> ResolvedSegments;
+	ResolvedSegments.Reserve(RequestedSegments.Num());
+
+	for (int32 Index = 0; Index < RequestedSegments.Num(); ++Index)
+	{
+		FProperty* MatchingProperty = nullptr;
+		if (!FindBindablePropertyBySegment(CurrentStruct, RequestedSegments[Index], MatchingProperty) || !MatchingProperty)
+		{
+			return false;
+		}
+
+		ResolvedSegments.Add(MatchingProperty->GetName());
+		if (Index == RequestedSegments.Num() - 1)
+		{
+			continue;
+		}
+
+		const FStructProperty* StructProperty = CastField<FStructProperty>(MatchingProperty);
+		if (!StructProperty || !StructProperty->Struct)
+		{
+			return false;
+		}
+
+		CurrentStruct = StructProperty->Struct;
+	}
+
+	OutResolvedPath = FString::Join(ResolvedSegments, TEXT("."));
+	return true;
+}
+
+static bool ResolveEventPayloadBindingPath(const UScriptStruct* PayloadStruct, const FString& RequestedPayloadPath, FString& OutResolvedPath)
+{
+	OutResolvedPath = RequestedPayloadPath;
+	if (!PayloadStruct)
+	{
+		return false;
+	}
+
+	FString ResolvedPayloadPath;
+	if (!ResolveBindablePropertyPathAgainstStruct(PayloadStruct, RequestedPayloadPath, ResolvedPayloadPath))
+	{
+		return false;
+	}
+
+	OutResolvedPath = FString::Printf(TEXT("Payload.%s"), *ResolvedPayloadPath);
+	return true;
+}
+
+static void AppendBindablePropertyInfo(FProperty* Property, void* ContainerValue, const FString& Prefix,
+	TArray<FStateTreePropertyInfo>& OutProperties, TSet<FString>* SeenPropertyPaths = nullptr)
+{
+	if (!Property || !ContainerValue)
+	{
+		return;
+	}
+
+	void* PropertyValuePtr = Property->ContainerPtrToValuePtr<void>(ContainerValue);
+	if (!PropertyValuePtr)
+	{
+		return;
+	}
+
+	const FString PropertySegment = GetBindablePropertySegmentName(Property);
+	const FString PropertyPath = Prefix.IsEmpty() ? PropertySegment : Prefix + TEXT(".") + PropertySegment;
+	if (SeenPropertyPaths && SeenPropertyPaths->Contains(PropertyPath))
+	{
+		return;
+	}
+
+	FStateTreePropertyInfo Info;
+	Info.Name = PropertyPath;
+	Info.Type = Property->GetCPPType();
+	Property->ExportText_Direct(Info.CurrentValue, PropertyValuePtr, PropertyValuePtr, nullptr, PPF_None);
+	OutProperties.Add(MoveTemp(Info));
+	if (SeenPropertyPaths)
+	{
+		SeenPropertyPaths->Add(PropertyPath);
+	}
+
+	if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+	{
+		if (const UScriptStruct* Struct = StructProperty->Struct)
+		{
+			for (TFieldIterator<FProperty> It(Struct); It; ++It)
+			{
+				FProperty* ChildProperty = *It;
+				if (!ChildProperty)
+				{
+					continue;
+				}
+
+				AppendBindablePropertyInfo(ChildProperty, PropertyValuePtr, PropertyPath, OutProperties, SeenPropertyPaths);
+			}
+		}
+	}
+}
+
+static void AppendBindableEditableProperties(const UStruct* RootStruct, void* RootValue,
+	TArray<FStateTreePropertyInfo>& OutProperties, TSet<FString>* SeenPropertyPaths = nullptr)
+{
+	if (!RootStruct || !RootValue)
+	{
+		return;
+	}
+
+	for (TFieldIterator<FProperty> It(RootStruct, EFieldIterationFlags::IncludeSuper); It; ++It)
+	{
+		FProperty* Property = *It;
+		if (!Property || Property->GetOwnerStruct() != RootStruct)
+		{
+			continue;
+		}
+
+		AppendBindablePropertyInfo(Property, RootValue, TEXT(""), OutProperties, SeenPropertyPaths);
 	}
 }
 
@@ -1232,6 +1426,10 @@ static FStateTreeTransitionInfo TransitionInfoFromTransition(const FStateTreeTra
 	if (Transition.RequiredEvent.Tag.IsValid())
 	{
 		Info.RequiredEventTag = Transition.RequiredEvent.Tag.ToString();
+	}
+	if (Transition.RequiredEvent.PayloadStruct)
+	{
+		Info.EventPayloadStruct = Transition.RequiredEvent.PayloadStruct->GetName();
 	}
 
 #if WITH_EDITORONLY_DATA
@@ -2166,6 +2364,45 @@ bool UStateTreeService::SetStateExpanded(const FString& AssetPath, const FString
 #endif
 }
 
+bool UStateTreeService::SelectState(const FString& AssetPath, const FString& StatePath)
+{
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("SelectState: Failed to load StateTree: %s"), *AssetPath);
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("SelectState: No editor data for %s"), *AssetPath);
+		return false;
+	}
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("SelectState: State not found: %s"), *StatePath);
+		return false;
+	}
+
+	UStateTreeEditingSubsystem* EditingSubsystem = GEditor->GetEditorSubsystem<UStateTreeEditingSubsystem>();
+	if (!EditingSubsystem)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("SelectState: UStateTreeEditingSubsystem not available"));
+		return false;
+	}
+
+	TSharedRef<FStateTreeViewModel> ViewModel = EditingSubsystem->FindOrAddViewModel(StateTree);
+	ViewModel->SetSelection(State);
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool UStateTreeService::SetContextActorClass(const FString& AssetPath, const FString& ActorClassPath)
 {
 	UStateTree* StateTree = LoadStateTree(AssetPath);
@@ -2819,6 +3056,8 @@ bool UStateTreeService::SetTaskConsideredForCompletion(const FString& AssetPath,
 
 bool UStateTreeService::UpdateTransition(const FString& AssetPath, const FString& StatePath, int32 TransitionIndex,
 	const FString& Trigger, const FString& TransitionType, const FString& TargetPath, const FString& Priority,
+	const FString& EventTag,
+	const FString& EventPayloadStruct,
 	bool bSetEnabled, bool bEnabled, bool bSetDelay, bool bDelayTransition, float DelayDuration, float DelayRandomVariance)
 {
 	UStateTree* StateTree = LoadStateTree(AssetPath);
@@ -2846,6 +3085,19 @@ bool UStateTreeService::UpdateTransition(const FString& AssetPath, const FString
 
 	if (!Trigger.IsEmpty())
 	{
+		// Validate trigger string — StringToTransitionTrigger silently falls back to OnStateCompleted
+		// for unknown values, so we validate explicitly to avoid silent no-ops.
+		static const TSet<FString> ValidTriggers = {
+			TEXT("OnStateCompleted"), TEXT("OnStateSucceeded"), TEXT("OnStateFailed"),
+			TEXT("OnTick"), TEXT("OnEvent"), TEXT("OnDelegate")
+		};
+		if (!ValidTriggers.Contains(Trigger))
+		{
+			UE_LOG(LogStateTreeService, Warning,
+				TEXT("UpdateTransition: Unknown trigger '%s'. Valid values: OnStateCompleted, OnStateSucceeded, OnStateFailed, OnTick, OnEvent, OnDelegate"),
+				*Trigger);
+			return false;
+		}
 		Trans.Trigger = StringToTransitionTrigger(Trigger);
 	}
 	if (!TransitionType.IsEmpty())
@@ -2898,10 +3150,105 @@ bool UStateTreeService::UpdateTransition(const FString& AssetPath, const FString
 		Trans.DelayDuration = DelayDuration;
 		Trans.DelayRandomVariance = DelayRandomVariance;
 	}
+	if (!EventTag.IsEmpty())
+	{
+		const FGameplayTag ParsedTag = FGameplayTag::RequestGameplayTag(FName(*EventTag), /*bErrorIfNotFound=*/false);
+		Trans.RequiredEvent.Tag = ParsedTag;
+	}
+	if (!EventPayloadStruct.IsEmpty())
+	{
+		if (EventPayloadStruct.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+		{
+			Trans.RequiredEvent.PayloadStruct = nullptr;
+		}
+		else
+		{
+			UScriptStruct* FoundStruct = FindNodeStruct(EventPayloadStruct);
+			if (!FoundStruct)
+			{
+				UE_LOG(LogStateTreeService, Warning, TEXT("UpdateTransition: EventPayloadStruct not found: %s"), *EventPayloadStruct);
+				return false;
+			}
+			Trans.RequiredEvent.PayloadStruct = FoundStruct;
+		}
+	}
 
 	MarkStateTreeDirty(StateTree);
 	UE_LOG(LogStateTreeService, Log, TEXT("UpdateTransition: Updated transition %d on state '%s' in %s"),
 		TransitionIndex, *StatePath, *AssetPath);
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool UStateTreeService::BindTransitionToDelegate(const FString& AssetPath, const FString& StatePath,
+	int32 TransitionIndex, const FString& TaskStructName, const FString& DispatcherPropertyName, int32 TaskMatchIndex)
+{
+	if (DispatcherPropertyName.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionToDelegate: DispatcherPropertyName is required"));
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree) { return false; }
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData) { return false; }
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionToDelegate: State not found: %s"), *StatePath);
+		return false;
+	}
+
+	if (!State->Transitions.IsValidIndex(TransitionIndex))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionToDelegate: TransitionIndex %d out of range (%d transitions) on state '%s'"),
+			TransitionIndex, State->Transitions.Num(), *StatePath);
+		return false;
+	}
+
+	FStateTreeTransition& Trans = State->Transitions[TransitionIndex];
+	if (Trans.Trigger != EStateTreeTransitionTrigger::OnDelegate)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("BindTransitionToDelegate: Transition %d trigger is '%s', not 'OnDelegate'. Call update_transition() with trigger='OnDelegate' first."),
+			TransitionIndex, *TransitionTriggerToString(Trans.Trigger));
+		return false;
+	}
+
+	FStateTreeEditorNode* TaskNode = FindTaskNodeByStruct(State, TaskStructName, TaskMatchIndex);
+	if (!TaskNode)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionToDelegate: Task '%s' not found in state '%s' (match index %d)"),
+			*TaskStructName, *StatePath, TaskMatchIndex);
+		return false;
+	}
+
+	// Source: the FStateTreeDelegateDispatcher property on the task node
+	FPropertyBindingPath SourcePath;
+	if (!MakeBindingPath(TaskNode->ID, DispatcherPropertyName, SourcePath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionToDelegate: Invalid dispatcher property name: %s"), *DispatcherPropertyName);
+		return false;
+	}
+
+	// Target: FStateTreeTransition.DelegateListener — the transition's delegate listener slot
+	FPropertyBindingPath TargetPath;
+	if (!MakeBindingPath(Trans.ID, TEXT("DelegateListener"), TargetPath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionToDelegate: Failed to create DelegateListener path for transition %d"), TransitionIndex);
+		return false;
+	}
+
+	EditorData->AddPropertyBinding(SourcePath, TargetPath);
+	MarkStateTreeDirty(StateTree);
+	UE_LOG(LogStateTreeService, Log, TEXT("BindTransitionToDelegate: Bound transition %d on '%s' to '%s.%s'"),
+		TransitionIndex, *StatePath, *TaskStructName, *DispatcherPropertyName);
 	return true;
 #else
 	return false;
@@ -3949,6 +4296,125 @@ bool UStateTreeService::BindEnterConditionPropertyToContext(const FString& Asset
 #endif
 }
 
+bool UStateTreeService::BindEnterConditionPropertyToRootParameter(const FString& AssetPath, const FString& StatePath,
+	const FString& ConditionStructName, const FString& ConditionPropertyPath, const FString& ParameterPath, int32 ConditionMatchIndex)
+{
+	if (ConditionPropertyPath.IsEmpty() || ParameterPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindEnterConditionPropertyToRootParameter: ConditionPropertyPath and ParameterPath are required"));
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		return false;
+	}
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindEnterConditionPropertyToRootParameter: State not found: %s"), *StatePath);
+		return false;
+	}
+
+	FStateTreeEditorNode* CondNode = FindEditorNodeByStructInArray(State->EnterConditions, ConditionStructName, ConditionMatchIndex);
+	if (!CondNode)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("BindEnterConditionPropertyToRootParameter: Condition '%s' not found in state '%s'"),
+			*ConditionStructName, *StatePath);
+		return false;
+	}
+
+	FPropertyBindingPath SourcePath;
+	if (!MakeBindingPath(EditorData->GetRootParametersGuid(), ParameterPath, SourcePath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindEnterConditionPropertyToRootParameter: Invalid parameter path: %s"), *ParameterPath);
+		return false;
+	}
+
+	FPropertyBindingPath TargetPath;
+	if (!MakeBindingPath(CondNode->ID, ConditionPropertyPath, TargetPath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindEnterConditionPropertyToRootParameter: Invalid condition property path: %s"), *ConditionPropertyPath);
+		return false;
+	}
+
+	EditorData->AddPropertyBinding(SourcePath, TargetPath);
+	MarkStateTreeDirty(StateTree);
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool UStateTreeService::UnbindEnterConditionProperty(const FString& AssetPath, const FString& StatePath,
+	const FString& ConditionStructName, const FString& ConditionPropertyPath, int32 ConditionMatchIndex)
+{
+	if (ConditionPropertyPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("UnbindEnterConditionProperty: ConditionPropertyPath is required"));
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		return false;
+	}
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("UnbindEnterConditionProperty: State not found: %s"), *StatePath);
+		return false;
+	}
+
+	FStateTreeEditorNode* CondNode = FindEditorNodeByStructInArray(State->EnterConditions, ConditionStructName, ConditionMatchIndex);
+	if (!CondNode)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("UnbindEnterConditionProperty: Condition '%s' not found in state '%s'"),
+			*ConditionStructName, *StatePath);
+		return false;
+	}
+
+	FPropertyBindingPath TargetPath;
+	if (!MakeBindingPath(CondNode->ID, ConditionPropertyPath, TargetPath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("UnbindEnterConditionProperty: Invalid condition property path: %s"), *ConditionPropertyPath);
+		return false;
+	}
+
+	FStateTreeEditorPropertyBindings* Bindings = EditorData->GetPropertyEditorBindings();
+	if (!Bindings)
+	{
+		return false;
+	}
+
+	Bindings->RemoveBindings(TargetPath);
+	MarkStateTreeDirty(StateTree);
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool UStateTreeService::AddTransitionCondition(const FString& AssetPath, const FString& StatePath,
 	int32 TransitionIndex, const FString& ConditionStructName)
 {
@@ -4116,6 +4582,43 @@ TArray<FStateTreePropertyInfo> UStateTreeService::GetTransitionConditionProperty
 	return Result;
 }
 
+TArray<FStateTreePropertyInfo> UStateTreeService::GetTransitionEventPayloadPropertyNames(const FString& AssetPath,
+	const FString& StatePath, int32 TransitionIndex)
+{
+	TArray<FStateTreePropertyInfo> Result;
+
+#if WITH_EDITORONLY_DATA
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree) { return Result; }
+
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData) { return Result; }
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State || !State->Transitions.IsValidIndex(TransitionIndex))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("GetTransitionEventPayloadPropertyNames: Invalid state or transition index"));
+		return Result;
+	}
+
+	FStateTreeTransition& Trans = State->Transitions[TransitionIndex];
+	if (!Trans.RequiredEvent.PayloadStruct)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("GetTransitionEventPayloadPropertyNames: Transition %d on state '%s' has no event payload struct set"),
+			TransitionIndex, *StatePath);
+		return Result;
+	}
+
+	FStructOnScope PayloadScope(Trans.RequiredEvent.PayloadStruct);
+	void* PayloadMemory = PayloadScope.GetStructMemory();
+	TSet<FString> SeenPropertyPaths;
+	AppendBindableEditableProperties(Trans.RequiredEvent.PayloadStruct, PayloadMemory, Result, &SeenPropertyPaths);
+#endif
+
+	return Result;
+}
+
 bool UStateTreeService::SetTransitionConditionPropertyValue(const FString& AssetPath, const FString& StatePath,
 	int32 TransitionIndex, const FString& ConditionStructName, const FString& PropertyPath,
 	const FString& Value, int32 ConditionMatchIndex)
@@ -4226,6 +4729,156 @@ bool UStateTreeService::BindTransitionConditionPropertyToContext(const FString& 
 	}
 
 	EditorData->AddPropertyBinding(SourcePath, TargetPath);
+	MarkStateTreeDirty(StateTree);
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool UStateTreeService::BindTransitionConditionPropertyToEventPayload(const FString& AssetPath, const FString& StatePath,
+	int32 TransitionIndex, const FString& ConditionStructName, const FString& ConditionPropertyPath,
+	const FString& PayloadPropertyPath, int32 ConditionMatchIndex)
+{
+	if (ConditionPropertyPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionConditionPropertyToEventPayload: ConditionPropertyPath is required"));
+		return false;
+	}
+
+	if (PayloadPropertyPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionConditionPropertyToEventPayload: PayloadPropertyPath is required"));
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		return false;
+	}
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State || !State->Transitions.IsValidIndex(TransitionIndex))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionConditionPropertyToEventPayload: Invalid state or transition index"));
+		return false;
+	}
+
+	FStateTreeTransition& Trans = State->Transitions[TransitionIndex];
+
+	if (!Trans.RequiredEvent.PayloadStruct)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("BindTransitionConditionPropertyToEventPayload: Transition %d on state '%s' has no event payload struct set"),
+			TransitionIndex, *StatePath);
+		return false;
+	}
+
+	FStateTreeEditorNode* CondNode = FindEditorNodeByStructInArray(
+		Trans.Conditions, ConditionStructName, ConditionMatchIndex);
+	if (!CondNode)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("BindTransitionConditionPropertyToEventPayload: Condition '%s' not found on transition %d of state '%s'"),
+			*ConditionStructName, TransitionIndex, *StatePath);
+		return false;
+	}
+
+	// The event payload's binding ID is derived from the transition's ID
+	const FGuid EventPayloadID = Trans.GetEventID();
+	FString ResolvedPayloadPropertyPath;
+	if (!ResolveEventPayloadBindingPath(Trans.RequiredEvent.PayloadStruct, PayloadPropertyPath, ResolvedPayloadPropertyPath))
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("BindTransitionConditionPropertyToEventPayload: Could not resolve payload property path '%s' on struct '%s'. Call GetTransitionEventPayloadPropertyNames() to inspect valid bindable paths."),
+			*PayloadPropertyPath, *Trans.RequiredEvent.PayloadStruct->GetName());
+		return false;
+	}
+
+	FPropertyBindingPath SourcePath;
+	if (!MakeBindingPath(EventPayloadID, ResolvedPayloadPropertyPath, SourcePath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionConditionPropertyToEventPayload: Invalid payload property path: %s"), *ResolvedPayloadPropertyPath);
+		return false;
+	}
+
+	FPropertyBindingPath TargetPath;
+	if (!MakeBindingPath(CondNode->ID, ConditionPropertyPath, TargetPath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("BindTransitionConditionPropertyToEventPayload: Invalid condition property path: %s"), *ConditionPropertyPath);
+		return false;
+	}
+
+	EditorData->AddPropertyBinding(SourcePath, TargetPath);
+	MarkStateTreeDirty(StateTree);
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool UStateTreeService::UnbindTransitionConditionProperty(const FString& AssetPath, const FString& StatePath,
+	int32 TransitionIndex, const FString& ConditionStructName, const FString& ConditionPropertyPath,
+	int32 ConditionMatchIndex)
+{
+	if (ConditionPropertyPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("UnbindTransitionConditionProperty: ConditionPropertyPath is required"));
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		return false;
+	}
+
+	UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+	if (!State || !State->Transitions.IsValidIndex(TransitionIndex))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("UnbindTransitionConditionProperty: Invalid state or transition index"));
+		return false;
+	}
+
+	FStateTreeTransition& Trans = State->Transitions[TransitionIndex];
+	FStateTreeEditorNode* CondNode = FindEditorNodeByStructInArray(Trans.Conditions, ConditionStructName, ConditionMatchIndex);
+	if (!CondNode)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("UnbindTransitionConditionProperty: Condition '%s' not found on transition %d of state '%s'"),
+			*ConditionStructName, TransitionIndex, *StatePath);
+		return false;
+	}
+
+	FPropertyBindingPath TargetPath;
+	if (!MakeBindingPath(CondNode->ID, ConditionPropertyPath, TargetPath))
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("UnbindTransitionConditionProperty: Invalid condition property path: %s"), *ConditionPropertyPath);
+		return false;
+	}
+
+	FStateTreeEditorPropertyBindings* Bindings = EditorData->GetPropertyEditorBindings();
+	if (!Bindings)
+	{
+		return false;
+	}
+
+	Bindings->RemoveBindings(TargetPath);
 	MarkStateTreeDirty(StateTree);
 	return true;
 #else
@@ -4425,7 +5078,8 @@ bool UStateTreeService::SetGlobalTaskPropertyValue(const FString& AssetPath, con
 
 bool UStateTreeService::AddTransition(const FString& AssetPath, const FString& StatePath,
                                        const FString& Trigger, const FString& TransitionType,
-                                       const FString& TargetPath, const FString& Priority)
+                                       const FString& TargetPath, const FString& Priority,
+                                       const FString& EventTag)
 {
 	UStateTree* StateTree = LoadStateTree(AssetPath);
 	if (!StateTree)
@@ -4491,6 +5145,11 @@ bool UStateTreeService::AddTransition(const FString& AssetPath, const FString& S
 
 	FStateTreeTransition& NewTransition = State->AddTransition(ParsedTrigger, ParsedType, TargetState);
 	NewTransition.Priority = ParsedPriority;
+	if (!EventTag.IsEmpty())
+	{
+		const FGameplayTag ParsedTag = FGameplayTag::RequestGameplayTag(FName(*EventTag), /*bErrorIfNotFound=*/false);
+		NewTransition.RequiredEvent.Tag = ParsedTag;
+	}
 
 	MarkStateTreeDirty(StateTree);
 	UE_LOG(LogStateTreeService, Log, TEXT("AddTransition: Added '%s' -> '%s' to state '%s' in %s"),
