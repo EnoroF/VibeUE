@@ -92,7 +92,7 @@ bool FMCPServer::Start()
     }
 
     // Re-validate VibeUE API key each time the server starts (picks up any key changes from settings)
-    ValidateVibeUEApiKeyAsync();
+    // ValidateVibeUEApiKeyAsync();
 
     if (Config.ApiKey.IsEmpty())
     {
