@@ -1692,7 +1692,7 @@ void FMCPServer::SaveEnabledToConfig(bool bEnabled)
 
 int32 FMCPServer::GetPortFromConfig()
 {
-    int32 Port = 8088; // Default port
+    int32 Port = 9099; // Default port
     GConfig->GetInt(TEXT("VibeUE.MCPServer"), TEXT("Port"), Port, GEditorPerProjectIni);
     return Port;
 }
