@@ -17,10 +17,10 @@ https://www.vibeue.com/
 ## ✨ Key Features
 
 - **In-Editor AI Chat** - Chat with AI directly inside Unreal Editor
-- **Python API Services** - 27 specialized services with 909 methods for Blueprints, Materials, Widgets, Landscape Terrain, Splines, Foliage, Animation Sequences, Animation Blueprints, Animation Montages, Niagara, Skeletons, Sound Cues, MetaSounds, Gameplay Tags, Screenshots, Runtime Virtual Textures, StateTree Behavior, Project/Engine Settings, and more
+- **Python API Services** - 29 specialized services with 950 methods for Blueprints, Materials, Widgets, Landscape Terrain, Splines, Foliage, Animation Sequences, Animation Blueprints, Animation Montages, Niagara, Skeletons, Sound Cues, MetaSounds, Gameplay Tags, Screenshots, Viewport Control, Runtime Virtual Textures, StateTree Behavior, Editor Transactions, Project/Engine Settings, and more
 - **Full Unreal Python Access** - Execute any Unreal Engine Python API through MCP
 - **MCP Tools** - 10 tools for discovery, execution, asset workflows, debugging, terrain generation, and web research
-- **Domain Skills** - 29 lazy-loaded skill packs covering Blueprints, graph editing, materials, terrain, animation, audio, AI, gameplay tags, widgets, data, and more
+- **Domain Skills** - 30 lazy-loaded skill packs covering Blueprints, graph editing, materials, terrain, animation, audio, AI, gameplay tags, widgets, viewport, data, and more
 - **Custom Instructions** - Add project-specific context via markdown files
 - **External IDE Integration** - Connect VS Code, Claude Code, Cursor, and AntiGravity via MCP
 
@@ -328,7 +328,7 @@ read_logs(action="read", file="chat", offset=1000, limit=500)
 read_logs(action="since", file="main", last_line=2500)
 ```
 
-### 2. VibeUE Python API Services (27 services, 909 methods)
+### 2. VibeUE Python API Services (29 services, 950 methods)
 High-level services exposed to Python for common game development tasks:
 
 | Service | Methods | Domain |
@@ -342,7 +342,7 @@ High-level services exposed to Python for common game development tasks:
 | `NiagaraService` | 37 | Niagara system lifecycle, emitters, parameters, settings discovery |
 | `MaterialService` | 30 | Materials and material instances |
 | `MetaSoundService` | 17 | MetaSound graph authoring, nodes, interfaces, inputs/outputs, and wiring |
-| `ActorService` | 27 | Level actor management, viewport camera control |
+| `ActorService` | 33 | Level actor management, viewport camera control, transform lock/constraints |
 | `InputService` | 23 | Enhanced Input actions, contexts, modifiers, triggers |
 | `EngineSettingsService` | 23 | Engine settings, rendering, physics, audio, cvars, scalability |
 | `NiagaraEmitterService` | 23 | Niagara emitter modules, renderers, properties |
@@ -357,9 +357,11 @@ High-level services exposed to Python for common game development tasks:
 | `DataTableService` | 15 | DataTable rows and structure |
 | `DataAssetService` | 11 | UDataAsset instances and properties |
 | `ScreenshotService` | 5 | Editor window and viewport screenshot capture for AI vision |
+| `ViewportService` | 19 | Viewport camera type (perspective/ortho), view mode, FOV, clip planes, exposure, game view, cinematic control, camera speed, viewport layout (single/quad) |
 | `RuntimeVirtualTextureService` | 4 | Runtime Virtual Texture assets, RVT volume actors, and landscape RVT assignment |
 | `SoundCueService` | 38 | Sound cue graph editing, sound node creation, wiring, and audio behavior authoring |
 | `StateTreeService` | 77 | StateTree asset creation, state hierarchy, state type/link configuration, editor selection, tasks, evaluators, conditions, transitions, delegate bindings, parameters, component overrides, property bindings, compile/save |
+| `EditorTransactionService` | 16 | Undo/redo, transaction grouping, history inspection, buffer reset |
 
 ### 3. Full Unreal Engine Python API
 Direct access to all `unreal.*` modules:
@@ -542,7 +544,7 @@ Each skill includes:
 
 Skills are automatically discovered at runtime from the `Content/Skills/` directory. Each skill folder contains a `skill.md` with YAML frontmatter defining its metadata. The system prompt's `{SKILLS}` token is replaced with a dynamically generated table of all available skills.
 
-Current skills include: `animation-blueprint`, `animation-editing`, `animation-montage`, `animsequence`, `asset-management`, `blueprint-graphs`, `blueprints`, `data-assets`, `data-tables`, `engine-settings`, `enhanced-input`, `enum-struct`, `foliage`, `gameplay-tags`, `landscape`, `landscape-auto-material`, `landscape-materials`, `level-actors`, `materials`, `metasounds`, `niagara-emitters`, `niagara-systems`, `project-settings`, `screenshots`, `skeleton`, `sound-cues`, `state-trees`, `terrain-data`, `umg-widgets`
+Current skills include: `animation-blueprint`, `animation-editing`, `animation-montage`, `animsequence`, `asset-management`, `blueprint-graphs`, `blueprints`, `data-assets`, `data-tables`, `engine-settings`, `enhanced-input`, `enum-struct`, `foliage`, `gameplay-tags`, `landscape`, `landscape-auto-material`, `landscape-materials`, `level-actors`, `materials`, `metasounds`, `niagara-emitters`, `niagara-systems`, `project-settings`, `screenshots`, `skeleton`, `sound-cues`, `state-trees`, `terrain-data`, `umg-widgets`, `viewport`
 
 ### Using Skills
 
@@ -860,11 +862,12 @@ AnimMontageService provides comprehensive CRUD operations for Animation Montage 
 - `get_row/update_row/remove_row(...)` - Row operations
 - `get_row_struct(path)` - Get column schema
 
-### ActorService (27 methods)
+### ActorService (33 methods)
 
 ActorService provides comprehensive level actor manipulation:
 - Actor discovery and queries
 - Transform operations (position, rotation, scale)
+- Transform locking and constraints
 - Selection management
 - Spawning and destruction
 - Property access
@@ -874,6 +877,14 @@ ActorService provides comprehensive level actor manipulation:
 - `set_viewport_camera(location, rotation)` — Position the editor viewport camera directly
 - `get_actor_view_camera(name, direction, padding)` — Calculate and apply a camera view that frames an actor from a direction (Top, Bottom, Left, Right, Front, Back)
 - `calculate_actor_view(name, direction, padding)` — Calculate view info without moving the camera
+
+**Transform Lock / Constraints:**
+- `set_actor_lock_location(name, locked)` — Lock/unlock an actor's location in the editor
+- `get_actor_lock_location(name)` — Query whether an actor's location is locked
+- `set_absolute_transform(name, location, rotation, scale)` — Set absolute (world-space) flags for location, rotation, scale
+- `get_absolute_transform(name)` — Query current absolute transform flags
+- `set_preserve_scale_ratio(enabled)` — Toggle the global "Preserve Scale Ratio" editor preference (padlock icon)
+- `get_preserve_scale_ratio()` — Query whether the scale ratio padlock is enabled
 
 ### SkeletonService (53 methods)
 
@@ -1158,6 +1169,39 @@ ScreenshotService enables AI vision by capturing editor content:
 - `get_active_window_title()` - Get focused window title
 - `is_editor_window_active()` - Check if editor is in focus
 
+### ViewportService (19 methods)
+
+ViewportService provides direct control of the active Unreal Editor level viewport:
+- `get_viewport_info()` - Get camera transform, viewport type, FOV, clip planes, exposure, layout, realtime/game view flags, and camera speed
+- `set/get_viewport_type(type)` - Switch between `perspective`, `top`, `bottom`, `left`, `right`, `front`, and `back`
+- `set/get_view_mode(mode)` - Control rendering mode: `lit`, `unlit`, `wireframe`, `detaillighting`, `lightingonly`, `lightcomplexity`, `shadercomplexity`, `pathtracing`, `clay`
+- `set/get_fov(degrees)` - Read and set perspective FOV
+- `set_near_clip_plane(distance)` / `set_far_clip_plane(distance)` - Adjust clipping planes for close-up or large-scene work
+- `set_exposure(fixed, ev100)` / `set_exposure_game_settings()` - Toggle fixed exposure or return to game settings / auto exposure
+- `set_game_view(enable)` - Toggle editor icon and gizmo visibility
+- `set_allow_cinematic_control(enable)` - Allow Sequencer to take over the viewport camera
+- `set_realtime(enable)` - Toggle realtime rendering
+- `set_camera_location(vector)` / `set_camera_rotation(rotator)` / `set_camera_speed(speed)` - Position and tune the editor camera
+- `set/get_viewport_layout(name)` - Switch between `OnePane`, `TwoPanesHoriz`, `TwoPanesVert`, `ThreePanesLeft`, `ThreePanesRight`, `ThreePanesTop`, `ThreePanesBottom`, `FourPanesLeft`, `FourPanesRight`, `FourPanesTop`, `FourPanesBottom`, and `FourPanes2x2` / `Quad`
+
+```python
+import unreal
+
+# Inspect the active viewport
+info = unreal.ViewportService.get_viewport_info()
+print(info.viewport_type, info.fov, info.layout)
+
+# Switch to quad view, then put the focused pane in top view
+unreal.ViewportService.set_viewport_layout("Quad")
+unreal.ViewportService.set_viewport_type("top")
+
+# Return to perspective with fixed exposure for look-dev
+unreal.ViewportService.set_viewport_type("perspective")
+unreal.ViewportService.set_fov(60.0)
+unreal.ViewportService.set_exposure(True, 1.0)
+unreal.ViewportService.set_view_mode("lit")
+```
+
 ### RuntimeVirtualTextureService (4 methods)
 
 RuntimeVirtualTextureService manages RVT assets and landscape integration:
@@ -1406,6 +1450,34 @@ Use `set_state_type`, `set_linked_subtree`, and `set_linked_asset` for in-place 
 **Compile & Save:**
 - `compile_state_tree(asset_path)` - Compile the asset; returns success flag, errors, and warnings
 - `save_state_tree(asset_path)` - Save to disk
+
+### EditorTransactionService (16 methods)
+
+EditorTransactionService provides programmatic undo/redo and transaction management:
+
+**Undo / Redo:**
+- `undo()` — Undo the last transaction
+- `redo()` — Redo the last undone transaction
+- `undo_multiple(count)` — Undo multiple transactions at once
+- `redo_multiple(count)` — Redo multiple transactions at once
+
+**Transaction Grouping:**
+- `begin_transaction(description)` — Open a named transaction scope
+- `end_transaction()` — Close the current transaction scope
+- `cancel_transaction()` — Cancel (rollback) the current transaction
+
+**History Inspection:**
+- `can_undo()` — Check if undo is available
+- `can_redo()` — Check if redo is available
+- `get_undo_description()` — Get the description of the next undo action
+- `get_redo_description()` — Get the description of the next redo action
+- `get_undo_history(count)` — List recent undo history entries
+- `get_redo_history(count)` — List recent redo history entries
+- `get_undo_count()` — Get total number of undo entries
+- `get_redo_count()` — Get total number of redo entries
+
+**Buffer Reset:**
+- `reset_history()` — Clear the entire undo/redo buffer
 
 ---
 

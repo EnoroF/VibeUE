@@ -13,7 +13,24 @@ unreal_classes:
 
 ## Critical Rules
 
-### 🚫 DEPRECATED: `unreal.EditorLevelLibrary`
+### � Creating a "Basic" Level Requires `new_level_from_template`, NOT `new_level`
+
+When the user asks to **create a new level** (especially "Basic", "Default", or with a sky/floor), **always** use `new_level_from_template`:
+
+```python
+subsys = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+# ❌ WRONG — creates a completely empty level with no content
+subsys.new_level("/Game/Maps/MyLevel")
+
+# ✅ CORRECT — creates level with floor, sky, lighting, player start
+subsys.new_level_from_template("/Game/Maps/MyLevel", "/Engine/Maps/Templates/Template_Default")
+```
+
+**Template names:** `Template_Default` = Basic, `OpenWorld`, `TimeOfDay_Default`, `VR-Basic`
+
+---
+
+### �🚫 DEPRECATED: `unreal.EditorLevelLibrary`
 
 **DO NOT use `unreal.EditorLevelLibrary`.** The entire Editor Scripting Utilities Plugin is deprecated in UE 5.7+. Use `unreal.EditorActorSubsystem` via `unreal.get_editor_subsystem()` for all level actor operations.
 
@@ -124,6 +141,50 @@ level_subsys.editor_invalidate_viewports()
 ---
 
 ## Workflows
+
+### Create Level from Template
+
+> 🚨 **Critical:** `new_level()` creates a **blank/empty** level with NO content (no floor, sky, lights, or player start). To get the standard "Basic" level with default content, ALWAYS use `new_level_from_template()` with `/Engine/Maps/Templates/Template_Default`.
+
+**Available UE 5.7 templates in `/Engine/Maps/Templates/`:**
+| Template path | Description |
+|---|---|
+| `/Engine/Maps/Templates/Template_Default` | **Basic** — floor, sky sphere, directional light, player start |
+| `/Engine/Maps/Templates/OpenWorld` | Open world with large terrain |
+| `/Engine/Maps/Templates/TimeOfDay_Default` | Time-of-day sky setup |
+| `/Engine/Maps/Templates/VR-Basic` | VR template |
+
+**Pattern: Create a new level from the Basic template**
+```python
+import unreal
+
+subsys = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+save_path  = "/Game/Maps/MyLevel"
+template   = "/Engine/Maps/Templates/Template_Default"
+
+# new_level_from_template: closes current level, creates from template, saves + loads
+result = subsys.new_level_from_template(save_path, template)
+print(f"Created: {result}")  # True on success
+```
+
+> ⚠️ **Cannot delete the currently-loaded level.** If the target path already exists and is loaded, you must first switch away using `new_level()` to a temp path, then create from template:
+```python
+import unreal
+
+subsys = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+target   = "/Game/Maps/MyLevel"
+template = "/Engine/Maps/Templates/Template_Default"
+
+# 1. Switch to temp level to unload target (so it can be overwritten)
+subsys.new_level("/Game/Maps/__TempSwitch")
+
+# 2. Create the actual level from template (overwrites any existing asset at target)
+result = subsys.new_level_from_template(target, template)
+print(f"Created from template: {result}")
+# Note: __TempSwitch is automatically replaced/closed — no manual cleanup needed
+```
+
+---
 
 ### Spawn Built-in Actor
 
@@ -265,3 +326,68 @@ view = actor_service.calculate_actor_view("MyActor", unreal.ViewDirection.RIGHT,
 | Profile view | `LEFT` or `RIGHT` |
 
 > ⚠️ **Do NOT switch to `set_viewport_camera` with manual coordinates to get a "better angle".** Manual positions almost always miss the subject and point at sky or empty space. If the view isn't wide enough, **increase the padding** or switch to `TOP`. There is no need for a diagonal camera — `TOP` and `FRONT` with adequate padding cover every screenshot use case.
+
+---
+
+### Transform Locking & Constraints
+
+#### 🔒 Location Locking (Per-Actor, Native UE5)
+
+UE5 has a native `bLockLocation` property on all actors. When locked, the actor cannot be moved via viewport gizmos (but CAN still be moved via code).
+
+```python
+import unreal
+
+# Lock an actor's location
+unreal.ActorService.set_actor_lock_location("MyCube", True)
+
+# Check if locked
+locked = unreal.ActorService.get_actor_lock_location("MyCube")
+print(f"Locked: {locked}")
+
+# Unlock
+unreal.ActorService.set_actor_lock_location("MyCube", False)
+```
+
+#### 🔒 Scale Ratio Lock (Uniform Scaling Padlock — Global Editor Setting)
+
+The padlock icon next to Scale in the Details panel is the **Preserve Scale Ratio** setting. When enabled, scaling any axis scales ALL axes proportionally. This is a **global editor preference**, not per-actor.
+
+```python
+import unreal
+
+# Lock scale axes together (uniform scaling) — the padlock icon
+unreal.ActorService.set_preserve_scale_ratio(True)
+
+# Unlock for independent axis scaling
+unreal.ActorService.set_preserve_scale_ratio(False)
+
+# Check current state
+locked = unreal.ActorService.get_preserve_scale_ratio()
+print(f"Scale ratio locked: {locked}")
+```
+
+#### ⚠️ There is NO Per-Actor Rotation or Scale Lock
+
+**UE5 does NOT have a per-actor lock for rotation or scale.** There is no `bLockRotation` or `bLockScale` property on actors. Only location locking (`set_actor_lock_location`) is per-actor.
+
+If user asks to "lock rotation" or "lock scale on this actor specifically":
+1. Explain this limitation clearly
+2. For uniform scaling, use `set_preserve_scale_ratio(True)` (global, affects all actors)
+3. For location locking, use `set_actor_lock_location`
+4. For world-space independence, use **absolute transform flags**
+
+#### Absolute Transform Flags (Per-Component)
+
+Make location/rotation/scale world-space instead of relative to parent. Useful when attaching actors but needing independent positioning.
+
+```python
+import unreal
+
+# Make rotation absolute (independent of parent), keep location/scale relative
+unreal.ActorService.set_absolute_transform("MyCube", False, True, False)
+
+# Check flags
+loc, rot, scale = unreal.ActorService.get_absolute_transform("MyCube")
+print(f"Absolute: loc={loc}, rot={rot}, scale={scale}")
+```
