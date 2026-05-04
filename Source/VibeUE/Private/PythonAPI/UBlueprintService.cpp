@@ -29,6 +29,7 @@
 #include "K2Node_AddDelegate.h"          // For delegate bind nodes (add_delegate_bind_node)
 #include "K2Node_CreateDelegate.h"       // For create event nodes (add_create_delegate_node)
 #include "K2Node_MakeStruct.h"           // For STRUCT key: creating typed struct Make nodes
+#include "EdGraphNode_Comment.h"         // For UEdGraphNode_Comment (comment box nodes)
 #include "InputAction.h"                 // For UInputAction
 #include "Kismet/KismetSystemLibrary.h"
 #include "Kismet/KismetMathLibrary.h"
@@ -140,6 +141,65 @@ namespace
 			if (UClass* FoundClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Engine.U%s"), *ClassName)))
 			{
 				return FoundClass;
+			}
+		}
+
+		// Blueprint asset path forms: "/Game/Path/BP_Foo", "/Game/Path/BP_Foo.BP_Foo",
+		// or "/Game/Path/BP_Foo.BP_Foo_C". FindObject/FindFirstObject only see classes
+		// already loaded into memory — for an unloaded Blueprint we have to actually
+		// load the asset to materialize its GeneratedClass.
+		if (ClassName.StartsWith(TEXT("/")))
+		{
+			FString PackagePath = ClassName;
+			int32 DotIdx;
+			if (PackagePath.FindChar(TEXT('.'), DotIdx))
+			{
+				PackagePath.LeftInline(DotIdx);
+			}
+			if (UObject* Loaded = UEditorAssetLibrary::LoadAsset(PackagePath))
+			{
+				if (UBlueprint* BP = Cast<UBlueprint>(Loaded))
+				{
+					if (BP->GeneratedClass)
+					{
+						return BP->GeneratedClass;
+					}
+				}
+				if (UClass* DirectClass = Cast<UClass>(Loaded))
+				{
+					return DirectClass;
+				}
+			}
+		}
+
+		// Asset registry lookup by short Blueprint name. Handles "BP_PatrolPointManager_C"
+		// and "BP_PatrolPointManager" when the Blueprint isn't loaded yet.
+		{
+			FString ShortName = ClassName;
+			if (ShortName.EndsWith(TEXT("_C"), ESearchCase::CaseSensitive))
+			{
+				ShortName.LeftChopInline(2);
+			}
+
+			if (!ShortName.IsEmpty() && !ShortName.Contains(TEXT("/")))
+			{
+				IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+				TArray<FAssetData> Assets;
+				Registry.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), Assets);
+				for (const FAssetData& Asset : Assets)
+				{
+					if (Asset.AssetName == FName(*ShortName))
+					{
+						if (UBlueprint* BP = Cast<UBlueprint>(Asset.GetAsset()))
+						{
+							if (BP->GeneratedClass)
+							{
+								return BP->GeneratedClass;
+							}
+						}
+						break;
+					}
+				}
 			}
 		}
 
@@ -3621,6 +3681,186 @@ FString UBlueprintService::AddPrintStringNode(
 	return PrintNode->NodeGuid.ToString();
 }
 
+namespace
+{
+	// Estimate a node's size for bounding-box math when NodeWidth/NodeHeight haven't been
+	// computed yet (Slate widget hasn't run). The defaults are intentionally generous so
+	// the comment box doesn't visually clip the wrapped nodes.
+	static void EstimateNodeBounds(UEdGraphNode* Node, float& OutMinX, float& OutMinY, float& OutMaxX, float& OutMaxY)
+	{
+		const float DefaultWidth = 256.0f;
+		const float DefaultHeight = 128.0f;
+
+		const float W = (Node && Node->NodeWidth  > 0.0f) ? Node->NodeWidth  : DefaultWidth;
+		const float H = (Node && Node->NodeHeight > 0.0f) ? Node->NodeHeight : DefaultHeight;
+
+		OutMinX = Node ? Node->NodePosX : 0.0f;
+		OutMinY = Node ? Node->NodePosY : 0.0f;
+		OutMaxX = OutMinX + W;
+		OutMaxY = OutMinY + H;
+	}
+
+	static UEdGraphNode_Comment* SpawnCommentNode(
+		UEdGraph* Graph,
+		const FString& CommentText,
+		float PosX, float PosY,
+		float Width, float Height,
+		float R, float G, float B, float A)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(Graph);
+		Graph->AddNode(CommentNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		CommentNode->CreateNewGuid();
+		CommentNode->PostPlacedNewNode();
+		CommentNode->AllocateDefaultPins();
+
+		CommentNode->NodePosX  = PosX;
+		CommentNode->NodePosY  = PosY;
+		CommentNode->NodeWidth  = FMath::Max(64.0f, Width);
+		CommentNode->NodeHeight = FMath::Max(64.0f, Height);
+		CommentNode->NodeComment = CommentText;
+		CommentNode->CommentColor = FLinearColor(R, G, B, A);
+
+		return CommentNode;
+	}
+}
+
+FString UBlueprintService::AddCommentNode(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& CommentText,
+	float PosX,
+	float PosY,
+	float Width,
+	float Height,
+	float R, float G, float B, float A)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentNode: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentNode: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("VibeUE", "AddCommentNode", "Add Comment Node"));
+	Graph->Modify();
+
+	UEdGraphNode_Comment* CommentNode = SpawnCommentNode(Graph, CommentText, PosX, PosY, Width, Height, R, G, B, A);
+	if (!CommentNode)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentNode: Failed to spawn comment node in graph '%s'"), *GraphName);
+		return FString();
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddCommentNode: Added comment '%s' in %s at (%.0f, %.0f) size (%.0f x %.0f)"),
+		*CommentText, *GraphName, PosX, PosY, Width, Height);
+
+	return CommentNode->NodeGuid.ToString();
+}
+
+FString UBlueprintService::AddCommentAroundNodes(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& CommentText,
+	const TArray<FString>& NodeIds,
+	float Padding,
+	float R, float G, float B, float A)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	if (NodeIds.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AddCommentAroundNodes: No node IDs provided"));
+		return FString();
+	}
+
+	// Resolve node IDs to actual nodes, ignoring (and warning about) unknown IDs.
+	TArray<UEdGraphNode*> Nodes;
+	Nodes.Reserve(NodeIds.Num());
+	for (const FString& Id : NodeIds)
+	{
+		if (UEdGraphNode* Node = FindNodeById(Graph, Id))
+		{
+			Nodes.Add(Node);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("AddCommentAroundNodes: Node id '%s' not found in graph '%s' (skipped)"),
+				*Id, *GraphName);
+		}
+	}
+
+	if (Nodes.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: None of the supplied node IDs were found in graph '%s'"), *GraphName);
+		return FString();
+	}
+
+	// Compute the bounding box.
+	float MinX = TNumericLimits<float>::Max();
+	float MinY = TNumericLimits<float>::Max();
+	float MaxX = TNumericLimits<float>::Lowest();
+	float MaxY = TNumericLimits<float>::Lowest();
+
+	for (UEdGraphNode* Node : Nodes)
+	{
+		float nMinX, nMinY, nMaxX, nMaxY;
+		EstimateNodeBounds(Node, nMinX, nMinY, nMaxX, nMaxY);
+		MinX = FMath::Min(MinX, nMinX);
+		MinY = FMath::Min(MinY, nMinY);
+		MaxX = FMath::Max(MaxX, nMaxX);
+		MaxY = FMath::Max(MaxY, nMaxY);
+	}
+
+	// Apply padding. The top edge needs a bit of extra room so the comment title bar
+	// doesn't overlap the wrapped nodes (~32px is the title bar in the editor).
+	const float TitleBar = 32.0f;
+	const float CommentX = MinX - Padding;
+	const float CommentY = MinY - Padding - TitleBar;
+	const float CommentW = (MaxX - MinX) + (Padding * 2.0f);
+	const float CommentH = (MaxY - MinY) + (Padding * 2.0f) + TitleBar;
+
+	const FScopedTransaction Transaction(NSLOCTEXT("VibeUE", "AddCommentAroundNodes", "Add Comment Around Nodes"));
+	Graph->Modify();
+
+	UEdGraphNode_Comment* CommentNode = SpawnCommentNode(Graph, CommentText, CommentX, CommentY, CommentW, CommentH, R, G, B, A);
+	if (!CommentNode)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddCommentAroundNodes: Failed to spawn comment node in graph '%s'"), *GraphName);
+		return FString();
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddCommentAroundNodes: Wrapped %d node(s) in graph '%s' with comment '%s'"),
+		Nodes.Num(), *GraphName, *CommentText);
+
+	return CommentNode->NodeGuid.ToString();
+}
+
 bool UBlueprintService::ConnectNodes(
 	const FString& BlueprintPath,
 	const FString& GraphName,
@@ -3793,6 +4033,151 @@ TArray<FBlueprintNodeInfo> UBlueprintService::GetNodesInGraph(
 		}
 
 		NodeInfos.Add(NodeInfo);
+	}
+
+	return NodeInfos;
+}
+
+namespace
+{
+	// Helper: convert a UEdGraphNode into the FBlueprintNodeInfo struct used by
+	// GetNodesInGraph / GetSelectedNodes. Mirrors the body of the GetNodesInGraph
+	// loop so both APIs produce identical shapes.
+	static FBlueprintNodeInfo MakeBlueprintNodeInfoFromNode(UEdGraphNode* Node)
+	{
+		FBlueprintNodeInfo NodeInfo;
+		if (!Node)
+		{
+			return NodeInfo;
+		}
+
+		NodeInfo.NodeId = Node->NodeGuid.ToString();
+		NodeInfo.NodeType = Node->GetClass()->GetName();
+		NodeInfo.NodeTitle = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+		NodeInfo.PosX = Node->NodePosX;
+		NodeInfo.PosY = Node->NodePosY;
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin)
+			{
+				continue;
+			}
+
+			NodeInfo.PinNames.Add(Pin->PinName.ToString());
+
+			FBlueprintPinInfo PinInfo;
+			PinInfo.PinName = Pin->PinName.ToString();
+			PinInfo.PinType = Pin->PinType.PinCategory.ToString();
+			PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
+			PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
+			PinInfo.DefaultValue = Pin->DefaultValue;
+			NodeInfo.Pins.Add(PinInfo);
+		}
+
+		return NodeInfo;
+	}
+}
+
+TArray<FBlueprintNodeInfo> UBlueprintService::GetSelectedNodes(const FString& BlueprintPath)
+{
+	TArray<FBlueprintNodeInfo> NodeInfos;
+
+	UAssetEditorSubsystem* AssetEditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+	if (!AssetEditorSubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: AssetEditorSubsystem not available"));
+		return NodeInfos;
+	}
+
+	// Helper lambda: gather the selected graph nodes from one Blueprint editor.
+	auto CollectFromEditor = [&NodeInfos](FBlueprintEditor* BlueprintEditor) -> bool
+	{
+		if (!BlueprintEditor)
+		{
+			return false;
+		}
+
+		const FGraphPanelSelectionSet Selection = BlueprintEditor->GetSelectedNodes();
+		if (Selection.Num() == 0)
+		{
+			return false;
+		}
+
+		for (UObject* SelectedObject : Selection)
+		{
+			if (UEdGraphNode* GraphNode = Cast<UEdGraphNode>(SelectedObject))
+			{
+				NodeInfos.Add(MakeBlueprintNodeInfoFromNode(GraphNode));
+			}
+		}
+		return NodeInfos.Num() > 0;
+	};
+
+	if (!BlueprintPath.IsEmpty())
+	{
+		// Caller specified the Blueprint — only inspect that one editor.
+		UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+		if (!Blueprint)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Failed to load blueprint: %s"), *BlueprintPath);
+			return NodeInfos;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+		if (!EditorInstance)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Blueprint '%s' is not open in the editor (selection state only exists for open assets)"), *BlueprintPath);
+			return NodeInfos;
+		}
+
+		// Blueprint editors all derive from FBlueprintEditor (incl. WidgetBlueprintEditor, AnimBlueprintEditor, etc.).
+		// We rely on the editor name guard to avoid an unsafe static_cast on unrelated editor types.
+		if (EditorInstance->GetEditorName() != FName(TEXT("BlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("WidgetBlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("AnimationBlueprintEditor")))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("GetSelectedNodes: Editor for '%s' is not a Blueprint editor (got '%s')"),
+				*BlueprintPath, *EditorInstance->GetEditorName().ToString());
+			return NodeInfos;
+		}
+
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		CollectFromEditor(BlueprintEditor);
+		return NodeInfos;
+	}
+
+	// No Blueprint specified — scan all open editors and return the first
+	// Blueprint editor that has a non-empty graph selection.
+	const TArray<UObject*> OpenAssets = AssetEditorSubsystem->GetAllEditedAssets();
+	for (UObject* Asset : OpenAssets)
+	{
+		UBlueprint* Blueprint = Cast<UBlueprint>(Asset);
+		if (!Blueprint)
+		{
+			continue;
+		}
+
+		IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+		if (!EditorInstance)
+		{
+			continue;
+		}
+
+		if (EditorInstance->GetEditorName() != FName(TEXT("BlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("WidgetBlueprintEditor"))
+			&& EditorInstance->GetEditorName() != FName(TEXT("AnimationBlueprintEditor")))
+		{
+			continue;
+		}
+
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		if (CollectFromEditor(BlueprintEditor))
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("GetSelectedNodes: Returning selection from blueprint '%s'"),
+				*Blueprint->GetPathName());
+			return NodeInfos;
+		}
 	}
 
 	return NodeInfos;
@@ -3985,6 +4370,155 @@ FString UBlueprintService::AddFunctionCallNode(
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 	UE_LOG(LogTemp, Log, TEXT("AddFunctionCallNode: Added %s::%s to %s"), *FunctionOwnerClass, *FunctionName, *GraphName);
+
+	return CallNode->NodeGuid.ToString();
+}
+
+FString UBlueprintService::AddFunctionCallOnVariable(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& VariableName,
+	const FString& FunctionName,
+	float PosX,
+	float PosY)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = FindGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+
+	if (!Blueprint->GeneratedClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Blueprint '%s' has no GeneratedClass — compile it first"), *BlueprintPath);
+		return FString();
+	}
+
+	// Resolve the variable's owner class via its property on the GeneratedClass.
+	// This handles inherited variables and avoids parsing FBPVariableDescription.VarType.
+	FProperty* VarProperty = Blueprint->GeneratedClass->FindPropertyByName(FName(*VariableName));
+	if (!VarProperty)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Variable '%s' not found on %s"), *VariableName, *BlueprintPath);
+		return FString();
+	}
+
+	UClass* OwnerClass = nullptr;
+	if (FObjectProperty* ObjProp = CastField<FObjectProperty>(VarProperty))
+	{
+		OwnerClass = ObjProp->PropertyClass;
+	}
+	else if (FClassProperty* ClassProp = CastField<FClassProperty>(VarProperty))
+	{
+		OwnerClass = ClassProp->MetaClass;
+	}
+
+	if (!OwnerClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Variable '%s' is not an object reference — cannot call a function on it"), *VariableName);
+		return FString();
+	}
+
+	// Find the function on the variable's class (or any parent).
+	UFunction* Function = OwnerClass->FindFunctionByName(FName(*FunctionName));
+	UEdGraphNode* SpawnedCallNode = nullptr;
+	if (!Function)
+	{
+		if (UBlueprintFunctionNodeSpawner* Spawner = FindBestFunctionSpawner(Blueprint, Graph, OwnerClass, FunctionName))
+		{
+			SpawnedCallNode = Spawner->Invoke(Graph, IBlueprintNodeBinder::FBindingSet(), FVector2D(PosX, PosY));
+			if (!SpawnedCallNode)
+			{
+				UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Spawner fallback matched '%s' on '%s' but failed to invoke"), *FunctionName, *OwnerClass->GetName());
+				return FString();
+			}
+			if (const UFunction* Resolved = Spawner->GetFunction())
+			{
+				Function = const_cast<UFunction*>(Resolved);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("AddFunctionCallOnVariable: Function '%s' not found on '%s'"), *FunctionName, *OwnerClass->GetName());
+			return FString();
+		}
+	}
+
+	// Build the function call node (unless the spawner already produced one).
+	UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(SpawnedCallNode);
+	if (!CallNode)
+	{
+		CallNode = NewObject<UK2Node_CallFunction>(Graph);
+		CallNode->SetFromFunction(Function);
+		Graph->AddNode(CallNode, false, false);
+		CallNode->CreateNewGuid();
+		CallNode->PostPlacedNewNode();
+		CallNode->AllocateDefaultPins();
+		CallNode->NodePosX = PosX;
+		CallNode->NodePosY = PosY;
+	}
+
+	// Build a self getter for the variable (offset to the left of the call node).
+	UK2Node_VariableGet* GetterNode = NewObject<UK2Node_VariableGet>(Graph);
+	GetterNode->VariableReference.SetSelfMember(FName(*VariableName));
+	Graph->AddNode(GetterNode, false, false);
+	GetterNode->CreateNewGuid();
+	GetterNode->PostPlacedNewNode();
+	GetterNode->AllocateDefaultPins();
+	GetterNode->NodePosX = PosX - 250.0f;
+	GetterNode->NodePosY = PosY + 16.0f;
+
+	// Wire variable output -> function call's self pin.
+	UEdGraphPin* VarOutPin = nullptr;
+	for (UEdGraphPin* Pin : GetterNode->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Output)
+		{
+			VarOutPin = Pin;
+			break;
+		}
+	}
+
+	UEdGraphPin* SelfPin = CallNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
+	if (!SelfPin)
+	{
+		// Some K2_* compact nodes use the function's first parameter as the self/target pin
+		// under a different display name. Fall back to the first input object pin.
+		for (UEdGraphPin* Pin : CallNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Input && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object)
+			{
+				SelfPin = Pin;
+				break;
+			}
+		}
+	}
+
+	if (VarOutPin && SelfPin)
+	{
+		const UEdGraphSchema* Schema = Graph->GetSchema();
+		Schema->TryCreateConnection(VarOutPin, SelfPin);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AddFunctionCallOnVariable: Created nodes but could not auto-wire self pin for '%s::%s' (var pin: %s, self pin: %s)"),
+			*OwnerClass->GetName(), *FunctionName,
+			VarOutPin ? TEXT("ok") : TEXT("missing"),
+			SelfPin ? TEXT("ok") : TEXT("missing"));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("AddFunctionCallOnVariable: %s.%s() in %s — call=%s, getter=%s"),
+		*VariableName, *FunctionName, *GraphName,
+		*CallNode->NodeGuid.ToString(), *GetterNode->NodeGuid.ToString());
 
 	return CallNode->NodeGuid.ToString();
 }
@@ -5460,13 +5994,108 @@ bool UBlueprintService::SetNodePinValue(
 			return false;
 		}
 	}
-	else
+	else if (PinCategory == UEdGraphSchema_K2::PC_Wildcard)
 	{
-		// Primitive/string/enum/struct — use schema string path
+		// BUG-2 fix (issue #373): wildcard pins (e.g. K2Node_Select case pins
+		// "NewEnumerator0..N" before the enum index resolves them) cannot store a
+		// literal default value. The schema silently drops the assignment, but
+		// SetNodePinValue used to claim success. Refuse with a diagnostic so
+		// callers know to either (a) configure the parent node so the pin
+		// resolves to a concrete type, or (b) wire a typed source like
+		// MakeLiteralName / MakeLiteralByte / MakeLiteralInt into the pin.
+		UE_LOG(LogTemp, Error,
+			TEXT("SetNodePinValue: Pin '%s' on node '%s' is a wildcard pin and cannot hold a literal default value. ")
+			TEXT("Resolve the wildcard first (e.g. configure the node's enum/type, or wire a MakeLiteral* source into the pin)."),
+			*PinName, *NodeId);
+		return false;
+	}
+	else if (PinCategory == UEdGraphSchema_K2::PC_Byte)
+	{
+		// BUG-1 fix (issue #373): some byte pins store the enum case name
+		// directly as a string (e.g. K2Node_EnumLiteral's "Enum" pin), while
+		// others — like the B pin of KismetMathLibrary::EqualEqual_ByteByte
+		// when typed against an enum-source — only accept the numeric byte
+		// value and silently drop case names. Try the value verbatim first; if
+		// the schema rejects it AND the pin is enum-typed, fall back to the
+		// numeric byte value of the named case before returning a hard failure.
+		const FString PreviousDefault = Pin->DefaultValue;
 		if (Schema)
 			Schema->TrySetDefaultValue(*Pin, Value);
 		else
 			Pin->DefaultValue = Value;
+
+		const bool bSchemaAccepted = Pin->DefaultValue.Equals(Value)
+			|| !Pin->DefaultValue.Equals(PreviousDefault);
+
+		if (!bSchemaAccepted)
+		{
+			UEnum* PinEnum = Cast<UEnum>(Pin->PinType.PinSubCategoryObject.Get());
+			const bool bIsNumeric = !Value.IsEmpty() && Value.IsNumeric();
+			if (PinEnum && !bIsNumeric)
+			{
+				int32 EnumIndex = PinEnum->GetIndexByNameString(Value);
+				if (EnumIndex == INDEX_NONE)
+				{
+					const FString PrefixedName = FString::Printf(TEXT("%s::%s"), *PinEnum->GetName(), *Value);
+					EnumIndex = PinEnum->GetIndexByNameString(PrefixedName);
+				}
+				if (EnumIndex == INDEX_NONE)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("SetNodePinValue: Value '%s' is not a valid case of enum '%s' for byte pin '%s' on node '%s'"),
+						*Value, *PinEnum->GetName(), *PinName, *NodeId);
+					return false;
+				}
+
+				const int64 NumericValue = PinEnum->GetValueByIndex(EnumIndex);
+				const FString NumericString = FString::Printf(TEXT("%lld"), NumericValue);
+				if (Schema)
+					Schema->TrySetDefaultValue(*Pin, NumericString);
+				else
+					Pin->DefaultValue = NumericString;
+
+				if (!Pin->DefaultValue.Equals(NumericString) && Pin->DefaultValue.Equals(PreviousDefault))
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("SetNodePinValue: Schema silently dropped enum case '%s' (numeric '%s') on byte pin '%s' on node '%s'"),
+						*Value, *NumericString, *PinName, *NodeId);
+					return false;
+				}
+
+				UE_LOG(LogTemp, Verbose,
+					TEXT("SetNodePinValue: Resolved enum case '%s' on enum '%s' to byte value '%s' for pin '%s'"),
+					*Value, *PinEnum->GetName(), *NumericString, *PinName);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("SetNodePinValue: Schema silently dropped value '%s' on byte pin '%s' on node '%s' (stored value remains '%s')"),
+					*Value, *PinName, *NodeId, *Pin->DefaultValue);
+				return false;
+			}
+		}
+	}
+	else
+	{
+		// Primitive/string/enum/struct — use schema string path
+		const FString PreviousDefault = Pin->DefaultValue;
+		if (Schema)
+			Schema->TrySetDefaultValue(*Pin, Value);
+		else
+			Pin->DefaultValue = Value;
+
+		// Silent-drop guard (issue #373): if the schema rejected the value but
+		// the pin allows non-empty defaults, surface a hard failure rather than
+		// returning true with no mutation. We compare against both the requested
+		// value and the prior value so a schema-normalized value (e.g. trimmed
+		// whitespace, canonical numeric form) still counts as success.
+		if (!Pin->DefaultValue.Equals(Value) && Pin->DefaultValue.Equals(PreviousDefault) && !Value.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("SetNodePinValue: Schema silently dropped value '%s' on pin '%s' (category '%s'); stored value remains '%s'"),
+				*Value, *PinName, *PinCategory.ToString(), *Pin->DefaultValue);
+			return false;
+		}
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
